@@ -18,9 +18,10 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+
 	"os"
 	"time"
-
+	"runtime"
 	"cloud.google.com/go/profiler"
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
@@ -32,6 +33,11 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"google.golang.org/grpc"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/shirou/gopsutil/cpu"
+
 )
 
 const (
@@ -53,6 +59,21 @@ var (
 		"GBP": true,
 		"TRY": true}
 )
+var cpuTimeMetric = prometheus.NewGauge(prometheus.GaugeOpts{
+    Name: "cpu_time_seconds",
+    Help: "CPU time in seconds",
+})
+
+
+
+var (
+	cpuUtilization = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "cpu_utilization",
+		Help: "Current CPU utilization of the service",
+	})
+)
+
+
 
 type ctxKeySessionID struct{}
 
@@ -82,7 +103,94 @@ type frontendServer struct {
 	collectorConn *grpc.ClientConn
 }
 
+
+func measureCPUTime() {
+    startTime := time.Now()
+
+ 
+
+    endTime := time.Now()
+    cpuTime := endTime.Sub(startTime).Seconds()
+
+    cpuTimeMetric.Set(cpuTime)
+}
+func measureCPUUtilization() {
+	for {
+		// Get CPU times
+		percent, err := cpu.Percent(time.Second, false)
+		if err != nil {
+			// Handle the error
+		}
+		utilizationPercentage := percent[0] * 100
+
+		// Update the CPU utilization metric
+		cpuUtilization.Set(utilizationPercentage)
+
+		// Sleep for some time before the next measurement
+		time.Sleep(time.Second)
+	}
+}
+var (
+	allocatedMemory = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "allocated_memory_bytes",
+		Help: "Current allocated memory in bytes",
+	})
+	totalAllocatedMemory = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "total_allocated_memory_bytes",
+		Help: "Total allocated memory in bytes",
+	})
+)
+
+
+
+
+
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func NewResponseWriter(w http.ResponseWriter) *responseWriter {
+	return &responseWriter{w, http.StatusOK}
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+var httpDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name: "http_response_time_seconds",
+	Help: "Duration of HTTP requests.",
+}, []string{"path"})
+
+
+func prometheusMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		route := mux.CurrentRoute(r)
+		path, _ := route.GetPathTemplate()
+
+		timer := prometheus.NewTimer(httpDuration.WithLabelValues(path))
+		rw := NewResponseWriter(w)
+		next.ServeHTTP(rw, r)
+
+
+
+		timer.ObserveDuration()
+	})
+}
+
+
+func init() {
+	prometheus.Register(cpuUtilization)
+	prometheus.Register(totalAllocatedMemory)
+	prometheus.Register(allocatedMemory)
+	prometheus.Register(httpDuration)
+
+
+}
 func main() {
+	go measureCPUUtilization()
+   
 	ctx := context.Background()
 	log := logrus.New()
 	log.Level = logrus.DebugLevel
@@ -136,9 +244,12 @@ func main() {
 	mustConnGRPC(ctx, &svc.shippingSvcConn, svc.shippingSvcAddr)
 	mustConnGRPC(ctx, &svc.checkoutSvcConn, svc.checkoutSvcAddr)
 	mustConnGRPC(ctx, &svc.adSvcConn, svc.adSvcAddr)
-
 	r := mux.NewRouter()
+	r.Use(prometheusMiddleware)
+
 	r.HandleFunc("/", svc.homeHandler).Methods(http.MethodGet, http.MethodHead)
+
+	// Record the response time metric
 	r.HandleFunc("/product/{id}", svc.productHandler).Methods(http.MethodGet, http.MethodHead)
 	r.HandleFunc("/cart", svc.viewCartHandler).Methods(http.MethodGet, http.MethodHead)
 	r.HandleFunc("/cart", svc.addToCartHandler).Methods(http.MethodPost)
@@ -149,7 +260,12 @@ func main() {
 	r.PathPrefix("/static/").Handler(http.StripPrefix("/static/", http.FileServer(http.Dir("./static/"))))
 	r.HandleFunc("/robots.txt", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "User-agent: *\nDisallow: /") })
 	r.HandleFunc("/_healthz", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "ok") })
+	r.Path("/metrics").Handler(promhttp.Handler())
+	
+	go updateMemoryMetrics()
 
+ 
+	
 	var handler http.Handler = r
 	handler = &logHandler{log: log, next: handler}     // add logging
 	handler = ensureSessionID(handler)                 // add session ID
@@ -157,10 +273,26 @@ func main() {
 
 	log.Infof("starting server on " + addr + ":" + srvPort)
 	log.Fatal(http.ListenAndServe(addr+":"+srvPort, handler))
+	select {}
+
 }
 func initStats(log logrus.FieldLogger) {
 	// TODO(arbrown) Implement OpenTelemtry stats
 }
+
+func updateMemoryMetrics() {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	allocatedMemory.Set(float64(m.Alloc))
+	totalAllocatedMemory.Add(float64(m.TotalAlloc))
+	time.Sleep(time.Second)
+
+}
+
+
+
+
 
 func initTracing(log logrus.FieldLogger, ctx context.Context, svc *frontendServer) (*sdktrace.TracerProvider, error) {
 	mustMapEnv(&svc.collectorAddr, "COLLECTOR_SERVICE_ADDR")
